@@ -27,6 +27,13 @@ export function protectedHomePaths({ home = ownerHome(), platform = process.plat
     path.join(home, '.config', 'webmcp'),
     path.join(home, 'Doc', 'devspace-container'),
     path.join(home, '.local', 'share', 'webmcp'),
+    // Other WebMCP providers' control state (tunnel identity, leases, settings): one
+    // provider's workspace must never reach another provider's authority.
+    path.join(home, '.config', 'tunnel-client'),
+    path.join(home, '.local', 'share', 'prism-webmcp'),
+    path.join(home, '.prism-webmcp'),
+    path.join(home, '.deepseek-webmcp'),
+    path.join(home, '.chatgpt-embedded-panel'),
     path.join(home, '.docker'),
     path.join(home, '.ssh'),
     path.join(home, '.aws'),
@@ -39,6 +46,7 @@ export function protectedHomePaths({ home = ownerHome(), platform = process.plat
   if (platform === 'darwin') {
     candidates.push(
       path.join(home, 'Library', 'Application Support', 'Firefox'),
+      path.join(home, 'Library', 'Application Support', 'tunnel-client'),
       ...MACOS_BROWSER_PROFILE_ROOTS.map((root) => path.join(home, 'Library', 'Application Support', root)),
       path.join(home, 'Library', 'LaunchAgents'),
       path.join(home, 'Library', 'Keychains'),

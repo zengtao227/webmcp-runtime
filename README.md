@@ -14,4 +14,4 @@ This repository owns the common local execution boundary:
 
 Provider-specific browser/UI/tunnel integration does not belong here.
 
-Consumers should pin an exact Git commit and deploy from that reviewed checkout.
+Consumers install it as a pinned release artifact: each GitHub Release carries one archive whose artifact id binds the Git commit to the payload digest; adapters pin the artifact id and the archive sha256 and verify both before use.
