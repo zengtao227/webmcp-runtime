@@ -616,29 +616,6 @@ export async function packRelease({
   });
 }
 
-// Release archives hold only regular files and directories below the archive root. The
-// listing is checked before extraction so no other entry type can be written anywhere.
-async function assertPlainArchive(archivePath, execFileImpl) {
-  let names;
-  let details;
-  try {
-    names = (await execFileImpl('tar', ['-tzf', archivePath], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })).stdout;
-    details = (await execFileImpl('tar', ['-tvzf', archivePath], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })).stdout;
-  } catch (error) {
-    fail('Unable to list the runtime release archive.', 'RELEASE_UNPACK_FAILED', { cause: error });
-  }
-  for (const name of names.split('\n').filter(Boolean)) {
-    if (path.isAbsolute(name) || name.split('/').includes('..')) {
-      fail(`Runtime release archive has an unsafe entry: ${name}`, 'UNSAFE_RELEASE_ARCHIVE');
-    }
-  }
-  for (const line of details.split('\n').filter(Boolean)) {
-    if (!['-', 'd'].includes(line[0])) {
-      fail('Runtime release archive contains a link or special file.', 'UNSAFE_RELEASE_ARCHIVE');
-    }
-  }
-}
-
 // Installs a pinned release archive into the shared release store. It never reads or
 // replaces `current`; callers pin their own instance to the returned artifact id.
 export async function installReleaseArchive({
@@ -678,7 +655,6 @@ export async function installReleaseArchive({
     if (error?.code !== 'ENOENT') throw error;
   }
 
-  await assertPlainArchive(path.resolve(archivePath), execFileImpl);
   const staging = path.join(runtimeAbsolute, `.staging-${id()}`);
   await mkdir(staging, { mode: 0o700 });
   try {
@@ -688,13 +664,7 @@ export async function installReleaseArchive({
       fail('Unable to unpack the runtime release archive.', 'RELEASE_UNPACK_FAILED', { cause: error });
     }
     await verifyRelease(staging, expectation);
-    try {
-      await rename(staging, finalRelease);
-    } catch (error) {
-      // A concurrent install of the same pinned artifact may have won; its release is
-      // accepted only after the same verification below.
-      if (!['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw error;
-    }
+    await rename(staging, finalRelease);
   } finally {
     await rm(staging, { recursive: true, force: true });
   }

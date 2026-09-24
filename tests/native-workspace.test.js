@@ -8,6 +8,7 @@ import path from 'node:path';
 import {
   createWorkspaceRuntime,
   decodeRuntimeMountPolicy,
+  DEFAULT_CHECKOUT_INSTRUCTION,
   NativeWorkspaceError,
   NATIVE_WORKSPACE_ROOT,
 } from '../native/src/workspace.js';
@@ -52,6 +53,9 @@ test('an adapter supplies its own checkout instruction without changing the defa
     assert.equal(opened.instruction, instruction);
   }, { checkoutInstruction: instruction });
   assert.throws(() => createWorkspaceRuntime({ root: '/workspace', checkoutInstruction: '' }), /checkout instruction/i);
+  await withRuntime(async ({ runtime }) => {
+    assert.equal((await runtime.openWorkspace(NATIVE_WORKSPACE_ROOT)).instruction, DEFAULT_CHECKOUT_INSTRUCTION);
+  });
 });
 
 test('read, write, and edit operate only through the active workspace id', async () => {
