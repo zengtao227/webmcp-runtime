@@ -44,6 +44,16 @@ test('open_workspace exposes only the fixed Native root and returns a runtime-bo
   });
 });
 
+test('an adapter supplies its own checkout instruction without changing the default', async () => {
+  const instruction = 'Workspace opened for bounded adapter coding. Remain inside /workspace.';
+  await withRuntime(async ({ runtime }) => {
+    const opened = await runtime.openWorkspace(NATIVE_WORKSPACE_ROOT);
+    assert.equal(opened.mode, 'checkout');
+    assert.equal(opened.instruction, instruction);
+  }, { checkoutInstruction: instruction });
+  assert.throws(() => createWorkspaceRuntime({ root: '/workspace', checkoutInstruction: '' }), /checkout instruction/i);
+});
+
 test('read, write, and edit operate only through the active workspace id', async () => {
   await withRuntime(async ({ root, runtime, workspaceId }) => {
     await writeFile(path.join(root, 'note.txt'), 'alpha\nbeta\n', 'utf8');

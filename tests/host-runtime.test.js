@@ -21,6 +21,8 @@ import {
   deployHostRuntime,
   HostRuntimeError,
   inspectSource,
+  installReleaseArchive,
+  packRelease,
   verifyCurrent,
   verifyRelease,
 } from '../adapter/deploy/deploy-host-runtime.js';
@@ -263,6 +265,42 @@ test('current pointer switches atomically to a verified release and keeps the pr
   });
 });
 
+test('a non-activating deploy adds a verified release without touching current', async () => {
+  await withTempDir(async (root) => {
+    const fixture = await createFixture(root);
+    const first = await deployFixture(fixture);
+    const currentPath = path.join(fixture.runtimeRoot, 'current');
+    const before = await readlink(currentPath);
+
+    await writeFile(path.join(fixture.sourceRoot, ENTRYPOINT), '#!/usr/bin/env node\nprocess.stdin.resume();\n// adapter\n');
+    await git(fixture.sourceRoot, ['add', ENTRYPOINT]);
+    await git(fixture.sourceRoot, [
+      '-c', 'user.name=Host Runtime Test',
+      '-c', 'user.email=host-runtime@example.invalid',
+      'commit', '-qm', 'adapter',
+    ]);
+    const second = await deployFixture(fixture, {
+      activate: false,
+      replaceCurrent: async () => assert.fail('a non-activating deploy must not replace current'),
+    });
+
+    assert.notEqual(second.artifactId, first.artifactId);
+    assert.equal(second.current, null);
+    assert.equal(await readlink(currentPath), before);
+    assert.equal((await verifyCurrent(fixture.runtimeRoot, { entrypoint: ENTRYPOINT })).artifactId, first.artifactId);
+    await verifyRelease(second.releaseDir, { expectedArtifactId: second.artifactId, entrypoint: ENTRYPOINT });
+  });
+});
+
+test('a non-activating deploy on a fresh machine creates no current pointer', async () => {
+  await withTempDir(async (root) => {
+    const fixture = await createFixture(root);
+    const release = await deployFixture(fixture, { activate: false });
+    await assert.rejects(lstat(path.join(fixture.runtimeRoot, 'current')), { code: 'ENOENT' });
+    await verifyRelease(release.releaseDir, { expectedArtifactId: release.artifactId, entrypoint: ENTRYPOINT });
+  });
+});
+
 test('current switch rejects a non-canonical alias even when artifact identity matches', async () => {
   await withTempDir(async (root) => {
     const fixture = await createFixture(root);
@@ -304,5 +342,114 @@ test('release verification rejects payload tampering and mode drift', async () =
       verifyRelease(result.releaseDir, { entrypoint: ENTRYPOINT }),
       assertHostRuntimeCode('RUNTIME_MANIFEST_MISMATCH'),
     );
+  });
+});
+
+test('a packed release installs on another machine by artifact id without Git or current', async () => {
+  await withTempDir(async (root) => {
+    const fixture = await createFixture(root);
+    const built = await deployFixture(fixture, { activate: false });
+    const archive = path.join(root, 'release.tar.gz');
+    const packed = await packRelease({ releaseDir: built.releaseDir, archivePath: archive, entrypoint: ENTRYPOINT });
+    assert.equal(packed.artifactId, built.artifactId);
+    assert.match(packed.archiveSha256, /^[0-9a-f]{64}$/);
+
+    const target = path.join(root, 'tester', 'host-runtime');
+    const installed = await installReleaseArchive({
+      archivePath: archive,
+      expectedArchiveSha256: packed.archiveSha256,
+      expectedArtifactId: built.artifactId,
+      runtimeRoot: target,
+      entrypoint: ENTRYPOINT,
+    });
+    assert.equal(installed.releaseDir, path.join(target, 'releases', built.artifactId));
+    await verifyRelease(installed.releaseDir, { expectedArtifactId: built.artifactId, entrypoint: ENTRYPOINT });
+    await assert.rejects(lstat(path.join(target, 'current')), { code: 'ENOENT' });
+
+    // Installing the same pinned artifact again is a verified no-op.
+    const again = await installReleaseArchive({
+      archivePath: archive,
+      expectedArchiveSha256: packed.archiveSha256,
+      expectedArtifactId: built.artifactId,
+      runtimeRoot: target,
+      entrypoint: ENTRYPOINT,
+    });
+    assert.equal(again.releaseDir, installed.releaseDir);
+  });
+});
+
+test('archive install rejects a wrong archive digest or artifact id and leaves nothing behind', async () => {
+  await withTempDir(async (root) => {
+    const fixture = await createFixture(root);
+    const built = await deployFixture(fixture, { activate: false });
+    const archive = path.join(root, 'release.tar.gz');
+    const packed = await packRelease({ releaseDir: built.releaseDir, archivePath: archive, entrypoint: ENTRYPOINT });
+    const target = path.join(root, 'tester', 'host-runtime');
+    const base = { archivePath: archive, runtimeRoot: target, entrypoint: ENTRYPOINT };
+
+    await assert.rejects(
+      installReleaseArchive({ ...base, expectedArchiveSha256: '0'.repeat(64), expectedArtifactId: built.artifactId }),
+      assertHostRuntimeCode('RELEASE_ARCHIVE_MISMATCH'),
+    );
+    const otherArtifact = `${'c'.repeat(40)}-${'d'.repeat(64)}`;
+    await assert.rejects(
+      installReleaseArchive({ ...base, expectedArchiveSha256: packed.archiveSha256, expectedArtifactId: otherArtifact }),
+      assertHostRuntimeCode('RUNTIME_MANIFEST_MISMATCH'),
+    );
+    const releases = path.join(target, 'releases');
+    const { readdir } = await import('node:fs/promises');
+    assert.deepEqual(await readdir(releases), []);
+    assert.deepEqual((await readdir(target)).filter((name) => name.startsWith('.staging-')), []);
+  });
+});
+
+test('archive install rejects links and parent-directory entries before extracting anything', async () => {
+  await withTempDir(async (root) => {
+    const payload = path.join(root, 'payload');
+    await mkdir(payload);
+    await writeFile(path.join(payload, 'manifest.json'), '{}');
+    await symlink('/etc/passwd', path.join(payload, 'link'));
+    const linkArchive = path.join(root, 'link.tar.gz');
+    await execFileAsync('tar', ['-czf', linkArchive, '-C', payload, '.']);
+    const outside = path.join(root, 'outside.txt');
+    await writeFile(outside, 'x');
+    const dotArchive = path.join(root, 'dot.tar.gz');
+    await execFileAsync('tar', ['-czf', dotArchive, '-C', payload, '../outside.txt']);
+    const { createHash } = await import('node:crypto');
+    const digest = async (file) => createHash('sha256').update(await readFile(file)).digest('hex');
+    const target = path.join(root, 'tester', 'host-runtime');
+    for (const archive of [linkArchive, dotArchive]) {
+      await assert.rejects(
+        installReleaseArchive({
+          archivePath: archive,
+          expectedArchiveSha256: await digest(archive),
+          expectedArtifactId: `${'a'.repeat(40)}-${'b'.repeat(64)}`,
+          runtimeRoot: target,
+          entrypoint: ENTRYPOINT,
+        }),
+        assertHostRuntimeCode('UNSAFE_RELEASE_ARCHIVE'),
+      );
+    }
+    const { readdir } = await import('node:fs/promises');
+    assert.deepEqual((await readdir(target)).filter((name) => name !== 'releases'), []);
+  });
+});
+
+test('concurrent installs of the same pinned archive both return the verified release', async () => {
+  await withTempDir(async (root) => {
+    const fixture = await createFixture(root);
+    const built = await deployFixture(fixture, { activate: false });
+    const archive = path.join(root, 'release.tar.gz');
+    const packed = await packRelease({ releaseDir: built.releaseDir, archivePath: archive, entrypoint: ENTRYPOINT });
+    const target = path.join(root, 'tester', 'host-runtime');
+    const install = () => installReleaseArchive({
+      archivePath: archive,
+      expectedArchiveSha256: packed.archiveSha256,
+      expectedArtifactId: built.artifactId,
+      runtimeRoot: target,
+      entrypoint: ENTRYPOINT,
+    });
+    const results = await Promise.all([install(), install(), install()]);
+    assert.ok(results.every((result) => result.releaseDir === path.join(target, 'releases', built.artifactId)));
   });
 });

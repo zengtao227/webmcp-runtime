@@ -125,46 +125,11 @@ function redactHighEntropyLiterals(text, reporter) {
   });
 }
 
-export function compileCustomPatterns(patterns = []) {
-  if (!Array.isArray(patterns)) {
-    throw new TypeError('Custom secret patterns must be an array');
-  }
-
-  return patterns.map((pattern, index) => {
-    if (!pattern || typeof pattern !== 'object') {
-      throw new TypeError(`Custom secret pattern ${index} must be an object`);
-    }
-
-    const { name, source, flags = '' } = pattern;
-    if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(name)) {
-      throw new TypeError(`Custom secret pattern ${index} has an invalid name`);
-    }
-
-    if (typeof source !== 'string' || source.length === 0 || source.length > 256) {
-      throw new TypeError(`Custom secret pattern ${name} has an invalid source`);
-    }
-
-    if (typeof flags !== 'string' || /[^imu]/.test(flags)) {
-      throw new TypeError(`Custom secret pattern ${name} has unsupported flags`);
-    }
-
-    let regex;
-    try {
-      regex = new RegExp(source, `${flags}g`);
-    } catch (error) {
-      throw new TypeError(`Custom secret pattern ${name} is invalid: ${error.message}`);
-    }
-
-    return { name, regex };
-  });
-}
-
-export function redactSecrets(input, options = {}) {
+export function redactSecrets(input) {
   if (typeof input !== 'string') {
     throw new TypeError('Secret scanner input must be a string');
   }
 
-  const customPatterns = compileCustomPatterns(options.customPatterns ?? []);
   const reporter = makeReporter();
   let text = input;
 
@@ -206,10 +171,6 @@ export function redactSecrets(input, options = {}) {
 
   text = redactNamedAssignments(text, reporter);
   text = redactHighEntropyLiterals(text, reporter);
-
-  for (const { name, regex } of customPatterns) {
-    text = replacePattern(text, regex, `custom:${name}`, reporter);
-  }
 
   return {
     text,

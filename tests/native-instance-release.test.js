@@ -13,7 +13,8 @@ import {
   pinInstanceToRelease,
   verifyPinnedInstanceRelease,
 } from '../native/deploy/instance-release.js';
-import { NATIVE_HOST_ENTRYPOINT } from '../native/deploy/deploy-host-boundary.js';
+import { NATIVE_HOST_ENTRYPOINT, NATIVE_HOST_RUNTIME_PAYLOAD } from '../native/deploy/deploy-host-boundary.js';
+import { pinnedInstanceRelease } from '../native/deploy/instance-context.js';
 
 const ARTIFACT = `${'a'.repeat(40)}-${'b'.repeat(64)}`;
 
@@ -122,4 +123,19 @@ test('default production instance cannot accidentally acquire a separate release
     verifyPinnedInstanceRelease(base, { loadPinImpl: async () => ({ version: 1, artifactId: ARTIFACT }) }),
     /non-default instance context/,
   );
+});
+
+test('a pinned release names only files the runtime release actually ships', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'webmcp-instance-release-'));
+  try {
+    const adapter = createInstanceContext({ home, instanceId: 'adapter' });
+    const release = pinnedInstanceRelease(adapter, ARTIFACT);
+    for (const [name, value] of Object.entries(release)) {
+      if (name === 'releaseId' || name === 'releaseRoot') continue;
+      const relative = path.relative(release.releaseRoot, value).split(path.sep).join('/');
+      assert.ok(NATIVE_HOST_RUNTIME_PAYLOAD.includes(relative), `${name} points at ${relative}, which the release does not ship`);
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });

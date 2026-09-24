@@ -139,6 +139,5 @@ export async function verifyPinnedInstanceRelease(context, {
     artifactId: pin.artifactId,
     releaseRoot: release.releaseRoot,
     hostEntrypoint: verified.entrypoint,
-    ownerControlEntrypoint: release.ownerControlEntrypoint,
   });
 }

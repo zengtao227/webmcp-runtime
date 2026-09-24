@@ -168,6 +168,9 @@ function applyExactEdits(source, edits) {
   return output;
 }
 
+// The ChatGPT/WebMCP resume protocol stays the default; other adapters pass their own text.
+export const DEFAULT_CHECKOUT_INSTRUCTION = 'Workspace opened. Before the first modification for a task: locate the target project, read its AGENTS.md, apply the WebMCP resume protocol, create or refresh the workspace-owned semantic checkpoint under /workspace/.webmcp/resumes/, and update /workspace/WEBMCP-RESUME.md as a pointer only. During recovery, read the referenced checkpoint and inspect Git/filesystem state; actual Git/filesystem state is authoritative.';
+
 export function createWorkspaceRuntime({
   root = NATIVE_WORKSPACE_ROOT,
   maxFileBytes = DEFAULT_MAX_FILE_BYTES,
@@ -179,9 +182,13 @@ export function createWorkspaceRuntime({
   runtimeToken = randomBytes(18).toString('base64url'),
   readOnly = false,
   mountPolicies = null,
+  checkoutInstruction = DEFAULT_CHECKOUT_INSTRUCTION,
 } = {}) {
   if (!path.isAbsolute(root)) {
     throw new NativeWorkspaceError('Workspace root must be absolute.', 'invalid_workspace_root');
+  }
+  if (typeof checkoutInstruction !== 'string' || checkoutInstruction.trim() === '') {
+    throw new NativeWorkspaceError('Checkout instruction must be non-empty text.', 'invalid_checkout_instruction');
   }
   const normalizedMountPolicies = normalizeRuntimeMountPolicies(root, mountPolicies);
   if (readOnly && normalizedMountPolicies !== null) {
@@ -484,7 +491,7 @@ export function createWorkspaceRuntime({
         workspaceId,
         root: NATIVE_WORKSPACE_ROOT,
         mode: 'checkout',
-        instruction: 'Workspace opened. Before the first modification for a task: locate the target project, read its AGENTS.md, apply the WebMCP resume protocol, create or refresh the workspace-owned semantic checkpoint under /workspace/.webmcp/resumes/, and update /workspace/WEBMCP-RESUME.md as a pointer only. During recovery, read the referenced checkpoint and inspect Git/filesystem state; actual Git/filesystem state is authoritative.',
+        instruction: checkoutInstruction,
       };
     },
     async read({ workspaceId: candidate, path: requestedPath, offset = 1, limit = DEFAULT_READ_LINES }) {

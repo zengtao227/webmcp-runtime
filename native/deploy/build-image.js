@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { inspectSource } from '../../adapter/deploy/deploy-host-runtime.js';
+import { inspectSource, verifyRelease } from '../../adapter/deploy/deploy-host-runtime.js';
+import { NATIVE_HOST_ENTRYPOINT } from './deploy-host-boundary.js';
 import { DEFAULT_IMAGE_PIN, IMAGE_PIN_VERSION, persistImagePin } from './image-pin.js';
 import {
   aggregateSourceDigest,
@@ -111,10 +112,58 @@ export async function buildNativeImage({
     entrypoint: NATIVE_RUNTIME_ENTRYPOINT,
   });
 
-  const runtimeSourceSha256 = aggregateSourceDigest(source.files);
+  return buildReviewedFiles({
+    files: source.files,
+    gitCommit: source.gitCommit,
+    baseImage,
+    outputPin,
+    tag,
+    dockerBin,
+    execFileImpl,
+  });
+}
+
+// Builds from an installed, verified release instead of a Git checkout. The pin path and
+// tag are required: the defaults belong to the default (ChatGPT) instance.
+export async function buildNativeImageFromRelease({
+  releaseDir,
+  expectedArtifactId,
+  baseImage,
+  outputPin,
+  tag,
+  dockerBin = 'docker',
+  execFileImpl = execFileAsync,
+} = {}) {
+  if (typeof outputPin !== 'string' || !path.isAbsolute(outputPin) || outputPin === DEFAULT_IMAGE_PIN) {
+    fail('An instance-owned absolute image pin path is required.', 'INVALID_IMAGE_PIN_PATH');
+  }
+  if (typeof tag !== 'string' || tag.length === 0 || /[\r\n\0]/.test(tag) || tag === DEFAULT_TAG) {
+    fail('An instance-owned image tag is required.', 'INVALID_IMAGE_TAG');
+  }
+  assertPinnedBaseImage(baseImage);
+  const { manifest } = await verifyRelease(releaseDir, { expectedArtifactId, entrypoint: NATIVE_HOST_ENTRYPOINT });
+  const files = [];
+  for (const relativePath of NATIVE_RUNTIME_PAYLOAD) {
+    const entry = manifest.files.find((file) => file.path === relativePath);
+    if (!entry) fail(`Release does not ship image source ${relativePath}.`, 'MISSING_RUNTIME_SOURCE');
+    files.push({ ...entry, bytes: await readFile(path.join(releaseDir, relativePath)) });
+  }
+  return buildReviewedFiles({
+    files,
+    gitCommit: manifest.gitCommit,
+    baseImage,
+    outputPin,
+    tag,
+    dockerBin,
+    execFileImpl,
+  });
+}
+
+async function buildReviewedFiles({ files, gitCommit, baseImage, outputPin, tag, dockerBin, execFileImpl }) {
+  const runtimeSourceSha256 = aggregateSourceDigest(files);
   const contextRoot = await mkdtemp(path.join(os.tmpdir(), 'webmcp-native-image-'));
   try {
-    await materializeReviewedContext(source, contextRoot);
+    await materializeReviewedContext({ files }, contextRoot);
     const dockerfile = path.join(contextRoot, 'native', 'Dockerfile');
     try {
       await execFileImpl(dockerBin, [
@@ -147,7 +196,7 @@ export async function buildNativeImage({
       image,
       sourceSha256: runtimeSourceSha256,
     });
-    return Object.freeze({ ...pin, gitCommit: source.gitCommit, tag });
+    return Object.freeze({ ...pin, gitCommit, tag });
   } finally {
     await rm(contextRoot, { recursive: true, force: true });
   }

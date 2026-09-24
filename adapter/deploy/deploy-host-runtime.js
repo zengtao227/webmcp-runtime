@@ -448,6 +448,9 @@ export async function deployHostRuntime({
   id = () => randomUUID(),
   writePayloadFile = defaultWritePayloadFile,
   replaceCurrent = rename,
+  // Non-default instances pin an exact artifact id, so their deploy must not move the
+  // shared current pointer that the default instance runs from.
+  activate = true,
 } = {}) {
   if (!sourceRoot || !runtimeRoot || !defaultWritableRoot) {
     fail('sourceRoot, runtimeRoot, and defaultWritableRoot are required.', 'INVALID_DEPLOY_OPTIONS');
@@ -468,7 +471,7 @@ export async function deployHostRuntime({
     additionalWritableRoots,
   });
 
-  const existingCurrent = await verifyCurrent(runtimeAbsolute, { entrypoint });
+  const existingCurrent = activate ? await verifyCurrent(runtimeAbsolute, { entrypoint }) : null;
   const source = await inspectSource({ sourceRoot: sourceAbsolute, payloadPaths, entrypoint });
   const releasesDir = path.join(runtimeAbsolute, 'releases');
   await mkdir(releasesDir, { recursive: true, mode: 0o700 });
@@ -528,6 +531,18 @@ export async function deployHostRuntime({
       entrypoint,
     });
 
+    if (!activate) {
+      return Object.freeze({
+        artifactId: source.artifactId,
+        gitCommit: source.gitCommit,
+        payloadSha256: source.payloadSha256,
+        releaseDir: finalRelease,
+        current: null,
+        entrypoint: path.join(finalRelease, entrypoint),
+        previousArtifactId: null,
+      });
+    }
+
     const currentPath = path.join(runtimeAbsolute, 'current');
     const temporaryCurrent = path.join(runtimeAbsolute, `.current-${id()}`);
     const relativeTarget = path.join('releases', source.artifactId);
@@ -570,4 +585,114 @@ export async function deployHostRuntime({
       await rm(staging, { recursive: true, force: true });
     }
   }
+}
+
+// A verified release directory is itself the distributable artifact: its manifest binds
+// every file digest to the artifact id. Packing only archives that directory.
+export async function packRelease({
+  releaseDir,
+  archivePath,
+  entrypoint,
+  execFileImpl = execFileAsync,
+} = {}) {
+  if (!releaseDir || !archivePath || !path.isAbsolute(archivePath)) {
+    fail('releaseDir and an absolute archivePath are required.', 'INVALID_PACK_OPTIONS');
+  }
+  const { manifest } = await verifyRelease(releaseDir, { entrypoint });
+  try {
+    await execFileImpl('tar', ['-czf', archivePath, '-C', releaseDir, '.'], { maxBuffer: 1024 * 1024 });
+  } catch (error) {
+    fail('Unable to pack the runtime release.', 'RELEASE_PACK_FAILED', { cause: error });
+  }
+  return Object.freeze({
+    artifactId: manifest.artifactId,
+    archivePath,
+    archiveSha256: sha256(await readFile(archivePath)),
+  });
+}
+
+// Release archives hold only regular files and directories below the archive root. The
+// listing is checked before extraction so no other entry type can be written anywhere.
+async function assertPlainArchive(archivePath, execFileImpl) {
+  let names;
+  let details;
+  try {
+    names = (await execFileImpl('tar', ['-tzf', archivePath], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })).stdout;
+    details = (await execFileImpl('tar', ['-tvzf', archivePath], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })).stdout;
+  } catch (error) {
+    fail('Unable to list the runtime release archive.', 'RELEASE_UNPACK_FAILED', { cause: error });
+  }
+  for (const name of names.split('\n').filter(Boolean)) {
+    if (path.isAbsolute(name) || name.split('/').includes('..')) {
+      fail(`Runtime release archive has an unsafe entry: ${name}`, 'UNSAFE_RELEASE_ARCHIVE');
+    }
+  }
+  for (const line of details.split('\n').filter(Boolean)) {
+    if (!['-', 'd'].includes(line[0])) {
+      fail('Runtime release archive contains a link or special file.', 'UNSAFE_RELEASE_ARCHIVE');
+    }
+  }
+}
+
+// Installs a pinned release archive into the shared release store. It never reads or
+// replaces `current`; callers pin their own instance to the returned artifact id.
+export async function installReleaseArchive({
+  archivePath,
+  expectedArchiveSha256,
+  expectedArtifactId,
+  runtimeRoot,
+  entrypoint,
+  id = () => randomUUID(),
+  execFileImpl = execFileAsync,
+} = {}) {
+  if (!archivePath || !runtimeRoot || !entrypoint) {
+    fail('archivePath, runtimeRoot, and entrypoint are required.', 'INVALID_INSTALL_OPTIONS');
+  }
+  if (typeof expectedArchiveSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(expectedArchiveSha256)) {
+    fail('A pinned archive sha256 is required.', 'INVALID_INSTALL_OPTIONS');
+  }
+  if (typeof expectedArtifactId !== 'string' || !/^[0-9a-f]{40}-[0-9a-f]{64}$/.test(expectedArtifactId)) {
+    fail('A pinned artifact id is required.', 'INVALID_INSTALL_OPTIONS');
+  }
+  // Check the pinned digest before tar parses anything from the download.
+  if (sha256(await readFile(archivePath)) !== expectedArchiveSha256) {
+    fail('Runtime release archive does not match its pinned sha256.', 'RELEASE_ARCHIVE_MISMATCH');
+  }
+
+  const runtimeAbsolute = path.resolve(runtimeRoot);
+  const releasesDir = path.join(runtimeAbsolute, 'releases');
+  await mkdir(releasesDir, { recursive: true, mode: 0o700 });
+  const finalRelease = path.join(releasesDir, expectedArtifactId);
+  const expectation = { expectedArtifactId, entrypoint };
+
+  try {
+    await lstat(finalRelease);
+    await verifyRelease(finalRelease, expectation);
+    return Object.freeze({ artifactId: expectedArtifactId, releaseDir: finalRelease });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  await assertPlainArchive(path.resolve(archivePath), execFileImpl);
+  const staging = path.join(runtimeAbsolute, `.staging-${id()}`);
+  await mkdir(staging, { mode: 0o700 });
+  try {
+    try {
+      await execFileImpl('tar', ['-xzf', path.resolve(archivePath), '-C', staging, '--no-same-owner'], { maxBuffer: 1024 * 1024 });
+    } catch (error) {
+      fail('Unable to unpack the runtime release archive.', 'RELEASE_UNPACK_FAILED', { cause: error });
+    }
+    await verifyRelease(staging, expectation);
+    try {
+      await rename(staging, finalRelease);
+    } catch (error) {
+      // A concurrent install of the same pinned artifact may have won; its release is
+      // accepted only after the same verification below.
+      if (!['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw error;
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+  await verifyRelease(finalRelease, expectation);
+  return Object.freeze({ artifactId: expectedArtifactId, releaseDir: finalRelease });
 }

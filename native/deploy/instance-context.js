@@ -104,6 +104,5 @@ export function pinnedInstanceRelease(context, releaseId) {
     releaseId,
     releaseRoot,
     hostEntrypoint: path.join(releaseRoot, NATIVE_HOST_ENTRYPOINT),
-    ownerControlEntrypoint: path.join(releaseRoot, 'native', 'deploy', 'installer.js'),
   });
 }

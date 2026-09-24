@@ -1,10 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  compileCustomPatterns,
-  redactSecrets,
-} from '../gateway/secret-scanner/index.js';
+import { redactSecrets } from '../gateway/secret-scanner/index.js';
 
 test('redacts named secrets in env, JSON, YAML, and code-like assignments', () => {
   const input = [
@@ -83,36 +80,6 @@ test('does not redact ordinary text or a hexadecimal commit-like hash', () => {
   assert.equal(result.redacted, false);
   assert.equal(result.text, input);
   assert.deepEqual(result.redactions, []);
-});
-
-test('supports validated user-defined regex redaction', () => {
-  const fakeCustom = 'FAKE-CUSTOM-A1B2C3D4';
-  const result = redactSecrets(`header=${fakeCustom}`, {
-    customPatterns: [
-      {
-        name: 'internal-fixture',
-        source: 'FAKE-CUSTOM-[A-Z0-9]{8}',
-      },
-    ],
-  });
-
-  assert.equal(result.text.includes(fakeCustom), false);
-  assert.deepEqual(result.redactions, [{ reason: 'custom:internal-fixture', count: 1 }]);
-});
-
-test('rejects malformed custom patterns instead of silently weakening policy', () => {
-  assert.throws(
-    () => compileCustomPatterns([{ name: 'bad', source: '[', flags: '' }]),
-    /is invalid/,
-  );
-  assert.throws(
-    () => compileCustomPatterns([{ name: 'bad', source: 'secret', flags: 's' }]),
-    /unsupported flags/,
-  );
-  assert.throws(
-    () => compileCustomPatterns([{ name: 'bad', source: 'x'.repeat(257) }]),
-    /invalid source/,
-  );
 });
 
 test('redaction metadata never contains the original secret value', () => {

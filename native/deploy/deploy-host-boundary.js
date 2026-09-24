@@ -35,6 +35,16 @@ export const NATIVE_HOST_RUNTIME_PAYLOAD = Object.freeze([
   'native/deploy/instance-transition.js',
   'native/deploy/workspace-config.js',
   'native/deploy/workspace-mount-config.js',
+  // The image source ships in the same release so one pinned artifact id also fixes
+  // the Docker image an installer builds, without a Git checkout on the tester machine.
+  'native/deploy/build-image.js',
+  'native/deploy/runtime-payload.js',
+  'native/Dockerfile',
+  'native/bin/start.js',
+  'native/src/server.js',
+  'native/src/stdio.js',
+  'native/src/workspace.js',
+  'gateway/path-policy/index.js',
 ]);
 
 export function defaultNativeHostRuntimeRoot(home = os.homedir()) {
@@ -44,6 +54,7 @@ export function defaultNativeHostRuntimeRoot(home = os.homedir()) {
 export async function deployNativeHostBoundary({
   sourceRoot,
   runtimeRoot = defaultNativeHostRuntimeRoot(),
+  activate = true,
 } = {}) {
   if (typeof sourceRoot !== 'string' || !path.isAbsolute(sourceRoot)) {
     throw new Error('sourceRoot must be the absolute repository root.');
@@ -56,6 +67,7 @@ export async function deployNativeHostBoundary({
     defaultWritableRoot: sourceRoot,
     payloadPaths: NATIVE_HOST_RUNTIME_PAYLOAD,
     entrypoint: NATIVE_HOST_ENTRYPOINT,
+    activate,
   });
 }
 
