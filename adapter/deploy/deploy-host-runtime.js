@@ -600,7 +600,12 @@ export async function packRelease({
   }
   const { manifest } = await verifyRelease(releaseDir, { entrypoint });
   try {
-    await execFileImpl('tar', ['-czf', archivePath, '-C', releaseDir, '.'], { maxBuffer: 1024 * 1024 });
+    // macOS tar would otherwise add AppleDouble `._*` entries for extended attributes,
+    // which verifyRelease rejects as unexpected files on the installing machine.
+    await execFileImpl('tar', ['-czf', archivePath, '-C', releaseDir, '.'], {
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    });
   } catch (error) {
     fail('Unable to pack the runtime release.', 'RELEASE_PACK_FAILED', { cause: error });
   }
