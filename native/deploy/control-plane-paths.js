@@ -25,7 +25,6 @@ export function protectedHomePaths({ home = ownerHome(), platform = process.plat
     // Every instance must mask the whole WebMCP config namespace, not only its own
     // config directory, or an elevated instance could mutate another instance's authority.
     path.join(home, '.config', 'webmcp'),
-    path.join(home, 'Doc', 'devspace-container'),
     path.join(home, '.local', 'share', 'webmcp'),
     // Other WebMCP providers' control state (tunnel identity, leases, settings): one
     // provider's workspace must never reach another provider's authority.
