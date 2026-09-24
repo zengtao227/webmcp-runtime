@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -124,9 +124,7 @@ export async function buildNativeImage({
 }
 
 // Builds from an installed, verified release instead of a Git checkout. The pin path and
-// tag are required: the defaults belong to the default (ChatGPT) instance. That instance
-// may claim the default pin only on a machine where it does not exist yet, so an
-// installed default instance is never replaced.
+// tag are required: the defaults belong to the default (ChatGPT) instance.
 export async function buildNativeImageFromRelease({
   releaseDir,
   expectedArtifactId,
@@ -135,19 +133,9 @@ export async function buildNativeImageFromRelease({
   tag,
   dockerBin = 'docker',
   execFileImpl = execFileAsync,
-  allowFreshDefaultPin = false,
-  defaultPin = DEFAULT_IMAGE_PIN,
 } = {}) {
-  if (typeof outputPin !== 'string' || !path.isAbsolute(outputPin)) {
+  if (typeof outputPin !== 'string' || !path.isAbsolute(outputPin) || outputPin === DEFAULT_IMAGE_PIN) {
     fail('An instance-owned absolute image pin path is required.', 'INVALID_IMAGE_PIN_PATH');
-  }
-  if (path.resolve(outputPin) === path.resolve(defaultPin)) {
-    if (!allowFreshDefaultPin) fail('An instance-owned absolute image pin path is required.', 'INVALID_IMAGE_PIN_PATH');
-    const exists = await lstat(outputPin).then(() => true, (error) => {
-      if (error?.code === 'ENOENT') return false;
-      throw error;
-    });
-    if (exists) fail('The default image pin already exists; an installed default instance is never replaced.', 'DEFAULT_IMAGE_PIN_EXISTS');
   }
   if (typeof tag !== 'string' || tag.length === 0 || /[\r\n\0]/.test(tag) || tag === DEFAULT_TAG) {
     fail('An instance-owned image tag is required.', 'INVALID_IMAGE_TAG');

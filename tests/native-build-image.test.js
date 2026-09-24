@@ -88,29 +88,3 @@ test('a release build refuses the default instance pin and tag, and a tampered r
     await assert.rejects(buildNativeImageFromRelease({ ...base, outputPin: ownPin, tag: 'webmcp-native:deepseek' }), { code: 'RUNTIME_MANIFEST_MISMATCH' });
   });
 });
-
-test('the default instance may take the default image pin only on a machine that has none', async () => {
-  await withRelease(async ({ root, release }) => {
-    const manifest = JSON.parse(await readFile(path.join(release.releaseDir, 'manifest.json'), 'utf8'));
-    const label = aggregateSourceDigest(manifest.files.filter((file) => NATIVE_RUNTIME_PAYLOAD.includes(file.path)));
-    const pin = path.join(root, 'default', 'native-image.json');
-    const options = {
-      releaseDir: release.releaseDir,
-      expectedArtifactId: release.artifactId,
-      baseImage: DEFAULT_NATIVE_BASE_IMAGE,
-      outputPin: pin,
-      defaultPin: pin,
-      tag: 'webmcp-native:chatgpt',
-    };
-    await assert.rejects(
-      buildNativeImageFromRelease({ ...options, execFileImpl: async () => assert.fail('docker must not run') }),
-      { code: 'INVALID_IMAGE_PIN_PATH' },
-    );
-    const built = await buildNativeImageFromRelease({ ...options, allowFreshDefaultPin: true, execFileImpl: fakeDocker(label, []) });
-    assert.equal(built.image, IMAGE_ID);
-    await assert.rejects(
-      buildNativeImageFromRelease({ ...options, allowFreshDefaultPin: true, execFileImpl: async () => assert.fail('docker must not run') }),
-      { code: 'DEFAULT_IMAGE_PIN_EXISTS' },
-    );
-  });
-});
