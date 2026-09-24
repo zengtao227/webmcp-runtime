@@ -602,7 +602,12 @@ export async function packRelease({
   try {
     // macOS tar would otherwise add AppleDouble `._*` entries for extended attributes,
     // which verifyRelease rejects as unexpected files on the installing machine.
-    await execFileImpl('tar', ['-czf', archivePath, '-C', releaseDir, '.'], {
+    // Published archives must not carry the packing account's user and group names.
+    const { stdout: tarVersion } = await execFileImpl('tar', ['--version'], { encoding: 'utf8' });
+    const ownership = /bsdtar/.test(tarVersion)
+      ? ['--uid', '0', '--gid', '0', '--uname', 'root', '--gname', 'root']
+      : ['--owner=root:0', '--group=root:0'];
+    await execFileImpl('tar', ['-czf', archivePath, ...ownership, '-C', releaseDir, '.'], {
       maxBuffer: 1024 * 1024,
       env: { ...process.env, COPYFILE_DISABLE: '1' },
     });

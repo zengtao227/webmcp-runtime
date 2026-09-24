@@ -348,6 +348,8 @@ test('a packed release installs on another machine by artifact id without Git or
     const packed = await packRelease({ releaseDir: built.releaseDir, archivePath: archive, entrypoint: ENTRYPOINT });
     assert.equal(packed.artifactId, built.artifactId);
     assert.match(packed.archiveSha256, /^[0-9a-f]{64}$/);
+    const listing = (await execFileAsync('tar', ['-tvzf', archive], { encoding: 'utf8' })).stdout;
+    assert.doesNotMatch(listing, new RegExp(`\\b${os.userInfo().username}\\b`), 'the archive must not name the packing account');
 
     const target = path.join(root, 'tester', 'host-runtime');
     const installed = await installReleaseArchive({
