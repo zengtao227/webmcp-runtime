@@ -1,0 +1,15 @@
+{
+  "name": "webmcp-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Shared provider-neutral WebMCP runtime for isolated workspace tools and temporary high-trust host access.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "build": "node scripts/build-native.mjs"
+  },
+  "license": "MIT"
+}
