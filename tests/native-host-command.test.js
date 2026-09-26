@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createElevatedLease, persistElevatedLease, clearElevatedLease, getBootSessionId, getLoginSessionId } from '../native/deploy/elevated-access.js';
@@ -10,7 +10,9 @@ import { createHostCommandHandler } from '../native/host/host-command.js';
 const BOOT = 'b'.repeat(64);
 const LOGIN = 'c'.repeat(64);
 
-async function fixture(accessLevel = 'full-host') {
+// `legacyVersion1` writes the old Full Working Access lease (version 1, no accessLevel), which
+// createElevatedLease no longer produces.
+async function fixture({ legacyVersion1 = false, durationMs = 60_000 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'webmcp-host-command-'));
   const configPath = path.join(root, 'workspace.json');
   const leasePath = path.join(root, 'lease.json');
@@ -24,11 +26,15 @@ async function fixture(accessLevel = 'full-host') {
     elevatedRoot: root,
     bootSessionId: BOOT,
     loginSessionId: LOGIN,
-    durationMs: 60_000,
-    accessLevel,
+    durationMs,
     platform: 'darwin',
   });
-  await persistElevatedLease(leasePath, lease);
+  if (legacyVersion1) {
+    const { accessLevel: _level, instanceId: _instance, ...rest } = lease;
+    await writeFile(leasePath, JSON.stringify({ ...rest, version: 1 }), { mode: 0o600 });
+  } else {
+    await persistElevatedLease(leasePath, lease);
+  }
   const handler = createHostCommandHandler({
     leasePath,
     configPath,
@@ -43,7 +49,7 @@ async function fixture(accessLevel = 'full-host') {
 }
 
 test('host command refuses normal and legacy Docker-only grants', async () => {
-  const legacy = await fixture('docker-full');
+  const legacy = await fixture({ legacyVersion1: true });
   try {
     const denied = await legacy.handler.call({ command: 'echo forbidden' });
     assert.equal(denied.structuredContent.error, 'HOST_ACCESS_NOT_GRANTED');
@@ -190,4 +196,16 @@ test('tracked background command survives a one-shot caller, yields incremental 
     assert.equal(await stat(expiryMarker).then(() => true, () => false), false);
     assert.equal((await expiryHandler.call({ action: 'read', sessionId: expiringCall.structuredContent.sessionId })).structuredContent.error, 'HOST_ACCESS_NOT_GRANTED');
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('lease expiry stops a running host command', async () => {
+  const host = await fixture({ durationMs: 1500 });
+  try {
+    const started = Date.now();
+    const stopped = await host.handler.call({ command: 'sleep 30', timeout: 30 });
+    assert.ok(Date.now() - started < 10_000, 'the command must not outlive the lease');
+    assert.ok(['HOST_COMMAND_TIMEOUT', 'HOST_ACCESS_REVOKED'].includes(stopped.structuredContent.error), JSON.stringify(stopped.structuredContent));
+    const after = await host.handler.call({ command: 'echo late' });
+    assert.equal(after.structuredContent.error, 'HOST_ACCESS_NOT_GRANTED');
+  } finally { host.handler.cancelAll(); await host.cleanup(); }
 });

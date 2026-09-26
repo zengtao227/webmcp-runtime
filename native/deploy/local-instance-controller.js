@@ -1,21 +1,18 @@
 import { execFile } from 'node:child_process';
-import { lstat, readFile, realpath, rm } from 'node:fs/promises';
+import { lstat, realpath, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   ensureNativeContainer,
-  inspectNativeContainer,
   inspectNativeContainerState,
   inspectNativeRuntimeVerification,
   prepareNativeContainerPolicyTransition,
   removeNativeContainer,
   removeNativeContainerForPolicyTransition,
-  removeStaleElevatedContainer,
 } from './container-controller.js';
 import { configureWorkspace } from './configure-workspace.js';
 import { defaultProtectedPaths } from './control-plane-paths.js';
 import {
-  buildElevatedWorkspaceConfig,
   clearElevatedLease,
   createElevatedLease,
   elevatedLeasePublicStatus,
@@ -24,19 +21,15 @@ import {
   loadElevatedLease,
   MAX_ELEVATED_LEASE_MS,
   parseElevatedDuration,
-  parseElevatedLease,
   persistElevatedLease,
 } from './elevated-access.js';
 import { loadImagePin, persistImagePin } from './image-pin.js';
 import { bumpInstanceAttachmentGeneration } from './instance-attachment.js';
 import { createInstanceContext, DEFAULT_INSTANCE_ID, normalizeInstanceId } from './instance-context.js';
 import { withInstanceLifecycleLock } from './instance-lock.js';
-import { armLocalInstanceExpiry } from './local-instance-expiry.js';
 import { pinInstanceToCurrentRelease, pinInstanceToRelease, verifyPinnedInstanceRelease } from './instance-release.js';
 import {
   applyContainerPolicyTransition,
-  applyElevatedTransition,
-  applyElevationRevoke,
   removeCreatedNativeContainer,
 } from './instance-transition.js';
 import { requestLocalElevationApproval } from './local-approval.js';
@@ -186,6 +179,14 @@ export async function provisionLocalInstance({
   });
 }
 
+// Host Access is a lease for host_command only; the container always runs with the instance's own
+// folders. An expired lease reads as normal: it grants nothing and a new grant replaces it.
+function leaseMode(leaseState) {
+  if (leaseState.state === 'active') return 'elevated';
+  if (['absent', 'expired'].includes(leaseState.state)) return 'normal';
+  return 'stale';
+}
+
 export async function localInstanceStatus({
   context,
   execFileImpl = execFileAsync,
@@ -208,66 +209,16 @@ export async function localInstanceStatus({
     getBootSessionIdImpl,
     getLoginSessionIdImpl,
   });
-  const leaseStatus = elevatedLeasePublicStatus(leaseState, { now });
-
-  if (!['absent', 'active'].includes(leaseState.state)) {
-    const container = await inspectNativeContainer({
-      execFileImpl,
-      containerRef: context.containerName,
-    });
-    return Object.freeze({
-      instanceId: context.instanceId,
-      mode: 'stale',
-      leaseState: leaseState.state,
-      ...(leaseState.reason ? { reason: leaseState.reason } : {}),
-      root: config.hostRoot,
-      normalRoot: config.hostRoot,
-      containerName: context.containerName,
-      artifactId: release.artifactId,
-      runtimeState: container ? (container?.State?.Running === true ? 'running' : 'stopped') : 'absent',
-      runtimeVerified: false,
-      attachmentChanged: false,
-    });
-  }
-
-  const options = containerOptions(
-    context,
-    execFileImpl,
-    platform,
-    leaseState.state === 'active' ? null : workspaceMountConfig,
-  );
-  if (leaseState.state === 'active') {
-    options.workspaceConfig = buildElevatedWorkspaceConfig(config, leaseState.lease.elevatedRoot, { platform });
-    options.elevationLeaseId = leaseState.lease.id;
-  }
-
-  let runtime;
-  try {
-    runtime = await inspectNativeContainerState(options);
-  } catch (error) {
-    return Object.freeze({
-      instanceId: context.instanceId,
-      ...leaseStatus,
-      root: leaseState.state === 'active' ? leaseState.lease.elevatedRoot : config.hostRoot,
-      normalRoot: config.hostRoot,
-      containerName: context.containerName,
-      artifactId: release.artifactId,
-      runtimeState: 'unverified',
-      runtimeVerified: false,
-      reason: error.message,
-      attachmentChanged: false,
-    });
-  }
-
+  const runtime = await inspectNativeRuntimeVerification(containerOptions(context, execFileImpl, platform, workspaceMountConfig));
   return Object.freeze({
     instanceId: context.instanceId,
-    ...leaseStatus,
-    root: leaseState.state === 'active' ? leaseState.lease.elevatedRoot : config.hostRoot,
+    ...elevatedLeasePublicStatus(leaseState, { now }),
+    mode: leaseMode(leaseState),
+    root: config.hostRoot,
     normalRoot: config.hostRoot,
     containerName: context.containerName,
     artifactId: release.artifactId,
-    runtimeState: runtime.present ? (runtime.running ? 'running' : 'stopped') : 'absent',
-    runtimeVerified: runtime.present,
+    ...runtime,
     attachmentChanged: false,
     ...(workspaceMountConfig === null ? {} : { mounts: workspaceMountConfig.mounts }),
   });
@@ -276,7 +227,6 @@ export async function localInstanceStatus({
 export async function grantLocalInstanceAccess({
   context,
   durationMs = MAX_ELEVATED_LEASE_MS,
-  accessLevel = 'docker-full',
   execFileImpl = execFileAsync,
   platform = 'darwin',
   now = null,
@@ -284,219 +234,70 @@ export async function grantLocalInstanceAccess({
   getBootSessionIdImpl = getBootSessionId,
   getLoginSessionIdImpl = getLoginSessionId,
   requestApprovalImpl = requestLocalElevationApproval,
-  armExpiryImpl = armLocalInstanceExpiry,
 } = {}) {
   assertLocalContext(context);
   return withInstanceLifecycleLock(context, async () => {
-    const requestStartedAt = now ?? Date.now();
-    const [normalConfig, workspaceMountConfig] = await Promise.all([
-      loadWorkspaceConfig(context.workspaceConfig, { platform }),
-      loadLocalMountConfig(context),
-    ]);
+    const normalConfig = await loadWorkspaceConfig(context.workspaceConfig, { platform });
     await verifyPinnedReleaseImpl(context);
     const existing = await localLeaseState(context, normalConfig, {
       execFileImpl,
       platform,
-      now: requestStartedAt,
+      now: now ?? Date.now(),
       getBootSessionIdImpl,
       getLoginSessionIdImpl,
     });
     if (existing.state === 'active') {
-      fail('Temporary elevated access is already active for this instance.', 'INSTANCE_ELEVATION_ALREADY_ACTIVE');
+      fail('Host Access is already active for this instance.', 'INSTANCE_ELEVATION_ALREADY_ACTIVE');
     }
-    if (existing.state !== 'absent') {
-      fail('Stale elevated state must be revoked before granting a new lease.', 'INSTANCE_ELEVATION_STATE_REQUIRES_REVOKE');
+    if (leaseMode(existing) === 'stale') {
+      fail('A Host Access lease that can no longer be verified must be revoked before a new grant.', 'INSTANCE_ELEVATION_STATE_REQUIRES_REVOKE');
     }
 
-    const [imagePin, bootSessionId, loginSessionId] = await Promise.all([
-      loadImagePin(context.imagePin),
+    const [bootSessionId, loginSessionId, ownerHome] = await Promise.all([
       getBootSessionIdImpl({ platform, execFileImpl }),
       getLoginSessionIdImpl({ platform, execFileImpl }),
+      realpath(context.home),
     ]);
-    const protectedPaths = await defaultProtectedPaths({
-      home: context.home,
-      configPath: context.workspaceConfig,
-      platform,
-    });
-    const probe = await verifyWorkspaceMount({
-      hostRoot: context.home,
-      image: imagePin.image,
-      protectedPaths,
-      platform,
-      execFileImpl,
-    });
     await requestApprovalImpl({
-      root: probe.canonicalRoot,
       durationMs,
-      accessLevel,
       instanceLabel: context.instanceId,
       execFileImpl,
     });
     const approvedAt = now ?? Date.now();
-    const attachmentGeneration = await bumpInstanceAttachmentGeneration(context);
-
     const lease = createElevatedLease({
       normalConfig,
-      elevatedRoot: probe.canonicalRoot,
+      elevatedRoot: ownerHome,
       bootSessionId,
       loginSessionId,
       durationMs,
       now: approvedAt,
       platform,
-      accessLevel,
       instanceId: context.instanceId,
     });
-    const elevatedConfig = buildElevatedWorkspaceConfig(normalConfig, lease.elevatedRoot, { platform });
-    // Arm an independent deadline enforcer before exposing elevated authority. Non-default
-    // hosts are per-call, so their in-process relay timer cannot outlive the request.
-    armExpiryImpl({ context, lease });
-    const normalOptions = containerOptions(context, execFileImpl, platform, workspaceMountConfig);
-    const elevatedOptions = {
-      ...normalOptions,
-      workspaceConfig: elevatedConfig,
-      workspaceMountConfig: null,
-      gitCredentialPath: null,
-      gitKnownHostsPath: null,
-      elevationLeaseId: lease.id,
-    };
-
-    await applyElevatedTransition({
-      stopService: async () => {},
-      removeNormalContainer: () => removeNativeContainer(normalOptions),
-      persistLease: () => persistElevatedLease(context.elevatedLease, lease),
-      ensureElevatedContainer: () => ensureNativeContainer(elevatedOptions),
-      startService: async () => {},
-      verifyElevated: async () => {
-        const runtime = await inspectNativeContainerState(elevatedOptions);
-        if (
-          !runtime.present
-          || !runtime.running
-          || runtime.canonicalRoot !== lease.elevatedRoot
-          || runtime.elevationLeaseId !== lease.id
-        ) {
-          fail('Local instance did not enter the approved elevated workspace.', 'INSTANCE_ELEVATION_VERIFY_FAILED');
-        }
-      },
-      clearLease: () => clearElevatedLease(context.elevatedLease),
-      removeElevatedContainer: () => removeStaleElevatedContainer({
-        imagePinPath: context.imagePin,
-        expectedLeaseId: lease.id,
-        containerName: context.containerName,
-        execFileImpl,
-      }),
-      ensureNormalContainer: () => ensureNativeContainer(normalOptions),
-    });
-
+    await persistElevatedLease(context.elevatedLease, lease);
     return Object.freeze({
       action: 'elevated',
       instanceId: context.instanceId,
       mode: 'elevated',
-      accessLevel,
-      root: lease.elevatedRoot,
-      normalRoot: normalConfig.hostRoot,
+      accessLevel: lease.accessLevel,
+      root: normalConfig.hostRoot,
       expiresAt: new Date(lease.expiresAt).toISOString(),
-      ...(accessLevel === 'full-host'
-        ? { hostUserAuthority: true }
-        : { networkEnabled: false, gitPublicationEnabled: false }),
-      attachmentGeneration,
-      attachmentChanged: true,
+      hostUserAuthority: true,
+      attachmentChanged: false,
     });
   });
 }
 
-export async function revokeLocalInstanceAccess({
-  context,
-  expectedLeaseId = null,
-  execFileImpl = execFileAsync,
-  platform = 'darwin',
-  verifyPinnedReleaseImpl = verifyPinnedInstanceRelease,
-} = {}) {
+// Revoking only lowers authority, so it needs neither Docker nor a verified release: host_command
+// reads the lease on every call and stops a running command once the lease is gone.
+export async function revokeLocalInstanceAccess({ context } = {}) {
   assertLocalContext(context);
   return withInstanceLifecycleLock(context, async () => {
-    const [normalConfig, workspaceMountConfig] = await Promise.all([
-      loadWorkspaceConfig(context.workspaceConfig, { platform }),
-      loadLocalMountConfig(context),
-    ]);
-    await verifyPinnedReleaseImpl(context);
-    const container = await inspectNativeContainer({
-      execFileImpl,
-      containerRef: context.containerName,
-    });
-    const leasePresent = await leaseExists(context);
-    const containerLeaseId = container?.Config?.Labels?.['com.webmcp.native.elevated-lease'] ?? null;
-    if (expectedLeaseId !== null) {
-      let persistedLeaseId = null;
-      if (leasePresent) {
-        try {
-          persistedLeaseId = parseElevatedLease(await readFile(context.elevatedLease, 'utf8')).id;
-        } catch {
-          // The worker already holds the exact lease id issued before elevation. If both
-          // the persisted lease and managed container identity are damaged, fail closed
-          // without guessing. If the container still proves the exact id, revoke it.
-          if (containerLeaseId !== expectedLeaseId) {
-            return Object.freeze({
-              action: 'unchanged',
-              instanceId: context.instanceId,
-              mode: 'normal',
-              root: normalConfig.hostRoot,
-              attachmentChanged: false,
-              reason: 'lease_identity_unavailable',
-            });
-          }
-          persistedLeaseId = expectedLeaseId;
-        }
-      }
-      if (persistedLeaseId !== expectedLeaseId || (containerLeaseId !== null && containerLeaseId !== expectedLeaseId)) {
-        return Object.freeze({
-          action: 'unchanged',
-          instanceId: context.instanceId,
-          mode: 'normal',
-          root: normalConfig.hostRoot,
-          attachmentChanged: false,
-          reason: 'lease_identity_changed',
-        });
-      }
+    if (!(await leaseExists(context))) {
+      return Object.freeze({ action: 'unchanged', instanceId: context.instanceId, mode: 'normal', attachmentChanged: false });
     }
-    if (!leasePresent && containerLeaseId === null) {
-      return Object.freeze({
-        action: 'unchanged',
-        instanceId: context.instanceId,
-        mode: 'normal',
-        root: normalConfig.hostRoot,
-        attachmentChanged: false,
-      });
-    }
-
-    const attachmentGeneration = await bumpInstanceAttachmentGeneration(context);
-    const normalOptions = containerOptions(context, execFileImpl, platform, workspaceMountConfig);
-    const removeElevated = () => removeStaleElevatedContainer({
-      imagePinPath: context.imagePin,
-      expectedLeaseId: expectedLeaseId ?? containerLeaseId,
-      containerName: context.containerName,
-      execFileImpl,
-    });
-    await applyElevationRevoke({
-      // This instance has no service process to stop. Removing its verified exact-id
-      // container first terminates old work before the lease is invalidated.
-      stopService: removeElevated,
-      clearLease: () => clearElevatedLease(context.elevatedLease),
-      removeElevatedContainer: removeElevated,
-      ensureNormalContainer: () => ensureNativeContainer(normalOptions),
-      startService: async () => {},
-    });
-    const runtime = await inspectNativeContainerState(normalOptions);
-    if (!runtime.present || !runtime.running || runtime.canonicalRoot !== normalConfig.hostRoot) {
-      fail('Local instance normal workspace was not restored after revoke.', 'INSTANCE_REVOKE_VERIFY_FAILED');
-    }
-
-    return Object.freeze({
-      action: 'revoked',
-      instanceId: context.instanceId,
-      mode: 'normal',
-      root: normalConfig.hostRoot,
-      attachmentGeneration,
-      attachmentChanged: true,
-    });
+    await clearElevatedLease(context.elevatedLease);
+    return Object.freeze({ action: 'revoked', instanceId: context.instanceId, mode: 'normal', attachmentChanged: false });
   });
 }
 
@@ -509,8 +310,9 @@ export async function reconfigureLocalInstance({
 } = {}) {
   assertLocalContext(context);
   return withInstanceLifecycleLock(context, async () => {
+    // The Host Access lease is bound to this root.
     if (await leaseExists(context)) {
-      fail('Revoke temporary elevated access before changing this instance workspace.', 'INSTANCE_ELEVATION_ACTIVE');
+      fail('Revoke Host Access before changing this instance workspace.', 'INSTANCE_ELEVATION_ACTIVE');
     }
     if (await loadLocalMountConfig(context)) {
       fail('Workspace reconfigure is unavailable while mounted-folder control is active.', 'MULTI_MOUNT_CONTROL_ACTIVE');
@@ -627,10 +429,6 @@ async function changeLocalInstanceMountedFolders({
 } = {}) {
   assertLocalContext(context);
   return withInstanceLifecycleLock(context, async () => {
-    if (await leaseExists(context)) {
-      fail('Revoke temporary elevated access before changing mounted folders.', 'INSTANCE_ELEVATION_ACTIVE');
-    }
-
     await verifyPinnedReleaseImpl(context);
     const [normalConfig, previousMountConfig] = await Promise.all([
       loadWorkspaceConfig(context.workspaceConfig, { platform }),
@@ -735,9 +533,9 @@ export async function setLocalInstanceMountedFolderWrite({
 
 export function parseLocalInstanceControlArgs(argv) {
   const command = argv[0];
-  if (!['mount-list', 'mount-add', 'mount-remove', 'mount-write', 'access-status', 'access-grant', 'host-access-grant', 'access-revoke'].includes(command)) {
+  if (!['mount-list', 'mount-add', 'mount-remove', 'mount-write', 'access-status', 'host-access-grant', 'access-revoke'].includes(command)) {
     fail(
-      'Expected one command: mount-list, mount-add, mount-remove, mount-write, access-status, access-grant, host-access-grant, access-revoke.',
+      'Expected one command: mount-list, mount-add, mount-remove, mount-write, access-status, host-access-grant, access-revoke.',
       'INVALID_LOCAL_INSTANCE_ARGUMENTS',
     );
   }
@@ -747,7 +545,6 @@ export function parseLocalInstanceControlArgs(argv) {
     'mount-remove': new Set(['--instance', '--id']),
     'mount-write': new Set(['--instance', '--id', '--on', '--off']),
     'access-status': new Set(['--instance']),
-    'access-grant': new Set(['--instance', '--duration']),
     'host-access-grant': new Set(['--instance', '--duration']),
     'access-revoke': new Set(['--instance']),
   }[command];
@@ -799,10 +596,9 @@ async function localInstanceControlMain() {
       });
     } else if (parsed.command === 'access-status') {
       result = await localInstanceStatus({ context });
-    } else if (parsed.command === 'access-grant' || parsed.command === 'host-access-grant') {
+    } else if (parsed.command === 'host-access-grant') {
       result = await grantLocalInstanceAccess({
         context,
-        ...(parsed.command === 'host-access-grant' ? { accessLevel: 'full-host' } : {}),
         ...(parsed.options.durationMs === undefined ? {} : { durationMs: parsed.options.durationMs }),
       });
     } else {

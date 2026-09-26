@@ -6,7 +6,6 @@ import { promisify } from 'node:util';
 import {
   buildNativeContainerRun,
   NATIVE_CONTAINER_NAME,
-  NATIVE_ELEVATED_LEASE_LABEL,
   NATIVE_GIT_KEY_PATH,
   NATIVE_GIT_KNOWN_HOSTS_PATH,
 } from './container-policy.js';
@@ -106,10 +105,6 @@ export function verifyContainer(container, expected) {
   }
   if (String(container?.Image ?? '').toLowerCase() !== expected.image.toLowerCase()) {
     fail('Existing Native container actual image does not match the reviewed image.', 'CONTAINER_IMAGE_MISMATCH');
-  }
-  const elevatedLeaseId = labels[NATIVE_ELEVATED_LEASE_LABEL] ?? null;
-  if (elevatedLeaseId !== expected.elevationLeaseId) {
-    fail('Existing Native container elevation state does not match the authorized lease.', 'CONTAINER_ELEVATION_MISMATCH');
   }
   const expectedUser = `${expected.hostUid}:${expected.hostGid}`;
   if (container?.Config?.User !== expectedUser) {
@@ -231,14 +226,12 @@ function verifyManagedContainerIdentity(container, {
   hostUid,
   hostGid,
   networkEnabled,
-  elevationLeaseId,
   requireStopped = false,
   errorMessage,
   errorCode,
 }) {
   const labels = container?.Config?.Labels ?? {};
   const containerId = container?.Id;
-  const actualLeaseId = labels[NATIVE_ELEVATED_LEASE_LABEL] ?? null;
   const capAdd = container?.HostConfig?.CapAdd ?? [];
   const capDrop = container?.HostConfig?.CapDrop ?? [];
   const devices = container?.HostConfig?.Devices ?? [];
@@ -262,12 +255,11 @@ function verifyManagedContainerIdentity(container, {
     && Array.isArray(securityOpt)
     && securityOpt.some((value) => String(value).startsWith('no-new-privileges'))
     && networkMatches
-    && actualLeaseId === elevationLeaseId
     && (!requireStopped || container?.State?.Running === false);
   if (!safelyIdentified) {
     fail(errorMessage, errorCode);
   }
-  return Object.freeze({ containerId, leaseId: actualLeaseId });
+  return Object.freeze({ containerId });
 }
 
 function verifyPolicyTransitionContainer(container, expected, { allowRunningStale = false } = {}) {
@@ -283,7 +275,6 @@ function verifyPolicyTransitionContainer(container, expected, { allowRunningStal
     hostUid: expected.hostUid,
     hostGid: expected.hostGid,
     networkEnabled: expected.networkEnabled,
-    elevationLeaseId: null,
     requireStopped: policyState === 'stale' && !allowRunningStale,
     errorMessage: 'Native container cannot be identified safely for mounted-folder recovery.',
     errorCode: 'CONTAINER_TRANSITION_UNVERIFIED',
@@ -301,7 +292,6 @@ async function resolveNativeContainerPolicy({
   gitCredentialPath = null,
   gitKnownHostsPath = null,
   protectedPaths = null,
-  elevationLeaseId = null,
   dockerBin = 'docker',
   execFileImpl = execFileAsync,
   platform = process.platform,
@@ -330,7 +320,6 @@ async function resolveNativeContainerPolicy({
     protectedPaths: effectiveProtected,
     gitCredentialPath,
     gitKnownHostsPath,
-    elevationLeaseId,
     platform,
     hostUid,
     hostGid,
@@ -350,7 +339,6 @@ async function resolveNativeContainerPolicy({
     gitCredentialSource: policy.gitCredentialSource,
     gitKnownHostsSource: policy.gitKnownHostsSource,
     maskPlan: policy.maskPlan,
-    elevationLeaseId: policy.elevationLeaseId,
     containerName: policy.containerName,
   });
   return Object.freeze({ config, imagePin, policy, expected });
@@ -369,7 +357,6 @@ export async function inspectNativeContainerState(options = {}) {
       running: false,
       policyDigest: resolved.policy.policyDigest,
       canonicalRoot: resolved.policy.canonicalRoot,
-      elevationLeaseId: resolved.expected.elevationLeaseId,
     });
   }
   verifyContainer(container, resolved.expected);
@@ -378,7 +365,6 @@ export async function inspectNativeContainerState(options = {}) {
     running: container?.State?.Running === true,
     policyDigest: resolved.policy.policyDigest,
     canonicalRoot: resolved.policy.canonicalRoot,
-    elevationLeaseId: resolved.expected.elevationLeaseId,
   });
 }
 
@@ -528,78 +514,6 @@ export async function removeNativeContainerForPolicyTransition(options = {}) {
     }
   }
   fail('Native container removal could not be confirmed.', 'CONTAINER_REMOVE_UNCONFIRMED');
-}
-
-export async function removeStaleElevatedContainer({
-  imagePinPath,
-  expectedLeaseId = null,
-  containerName = NATIVE_CONTAINER_NAME,
-  dockerBin = 'docker',
-  execFileImpl = execFileAsync,
-  hostUid = typeof process.getuid === 'function' ? process.getuid() : null,
-  hostGid = typeof process.getgid === 'function' ? process.getgid() : null,
-} = {}) {
-  if (typeof imagePinPath !== 'string' || !path.isAbsolute(imagePinPath)) {
-    fail('imagePinPath must be an absolute host path.', 'IMAGE_PIN_REQUIRED');
-  }
-  const imagePin = await loadImagePin(imagePinPath);
-  await inspectNativeImage(imagePin, { dockerBin, execFileImpl });
-  const container = await inspectNativeContainer({ dockerBin, execFileImpl, containerRef: containerName });
-  if (!container) {
-    return Object.freeze({ action: 'absent' });
-  }
-  const labels = container?.Config?.Labels ?? {};
-  const leaseId = labels[NATIVE_ELEVATED_LEASE_LABEL] ?? null;
-  // Rollback may arrive here after stop/remove failed before any elevated container existed.
-  // A container without an elevation lease is not stale authority; ensureNormalContainer
-  // performs the full normal-container verification later in the rollback sequence.
-  if (leaseId === null) {
-    return Object.freeze({ action: 'normal' });
-  }
-  if (expectedLeaseId !== null && leaseId !== expectedLeaseId) {
-    fail('Elevated Native container does not match the expected lease identity.', 'ELEVATED_CONTAINER_UNVERIFIED');
-  }
-  const { containerId } = verifyManagedContainerIdentity(container, {
-    image: imagePin.image,
-    hostUid,
-    hostGid,
-    networkEnabled: false,
-    elevationLeaseId: leaseId,
-    errorMessage: 'Stale elevated Native container cannot be identified safely.',
-    errorCode: 'ELEVATED_CONTAINER_UNVERIFIED',
-  });
-  const workspaceMount = Array.isArray(container?.Mounts)
-    ? container.Mounts.find((mount) => mount?.Destination === '/workspace')
-    : null;
-  const gitMount = Array.isArray(container?.Mounts)
-    ? container.Mounts.find((mount) => [NATIVE_GIT_KEY_PATH, NATIVE_GIT_KNOWN_HOSTS_PATH].includes(mount?.Destination))
-    : null;
-  const safelyIdentified = /^[0-9a-f]{64}$/i.test(leaseId)
-    && workspaceMount?.RW === true
-    && path.isAbsolute(workspaceMount?.Source ?? '')
-    && !gitMount;
-  if (!safelyIdentified) {
-    fail('Stale elevated Native container cannot be identified safely.', 'ELEVATED_CONTAINER_UNVERIFIED');
-  }
-  try {
-    await execFileImpl(dockerBin, ['rm', '-f', containerId], {
-      encoding: 'utf8',
-      maxBuffer: 1024 * 1024,
-    });
-  } catch (error) {
-    fail('Unable to remove the stale elevated Native container.', 'CONTAINER_REMOVE_FAILED', { cause: error });
-  }
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const remaining = await inspectNativeContainer({ dockerBin, execFileImpl, containerRef: containerName });
-    if (!remaining) {
-      return Object.freeze({ action: 'removed', leaseId, containerId });
-    }
-    if (remaining?.Id !== containerId) {
-      fail('A different Native container appeared before elevated revocation could be confirmed.', 'ELEVATED_CONTAINER_UNVERIFIED');
-    }
-  }
-  fail('Elevated Native container removal could not be confirmed.', 'CONTAINER_REMOVE_UNCONFIRMED');
 }
 
 export async function ensureNativeContainer(options = {}) {

@@ -8,7 +8,8 @@ import { normalizeWorkspaceConfig } from './workspace-config.js';
 
 const execFileAsync = promisify(execFile);
 
-export const ELEVATED_LEASE_VERSION = 1;
+// The one lease WebMCP grants is Host Access (High Trust): it authorizes host_command and never
+// changes the container. Version 1 leases (Full Working Access, removed) no longer parse.
 export const HOST_ACCESS_LEASE_VERSION = 2;
 export const FULL_HOST_ACCESS_LEVEL = 'full-host';
 export const MAX_ELEVATED_LEASE_MS = 60 * 60 * 1000;
@@ -57,21 +58,6 @@ export function parseElevatedDuration(value = '60m') {
     fail('Elevated duration must be greater than zero and no longer than 1 hour.', 'INVALID_ELEVATED_DURATION');
   }
   return durationMs;
-}
-
-export function buildElevatedWorkspaceConfig(normalConfig, elevatedRoot, { platform = process.platform } = {}) {
-  normalizeWorkspaceConfig(normalConfig, { platform });
-  // Elevation is the owner's deliberate, locally approved, time-capped grant of writable access,
-  // and both the CLI and the macOS panel promise exactly that. It therefore overrides a read-only
-  // host for the lease instead of producing a wider scope nobody can write to. The normal config on
-  // disk is untouched, so restoreNormal brings read-only back when the lease ends.
-  return normalizeWorkspaceConfig({
-    version: 1,
-    hostRoot: elevatedRoot,
-    mode: 'advanced',
-    networkEnabled: false,
-    gitPublicationEnabled: false,
-  }, { platform });
 }
 
 export async function getBootSessionId({
@@ -130,11 +116,12 @@ export function createElevatedLease({
   now = Date.now(),
   leaseId = randomBytes(32).toString('hex'),
   platform = process.platform,
-  accessLevel = 'docker-full',
   instanceId = 'default',
 } = {}) {
   const normalizedNormal = normalizeWorkspaceConfig(normalConfig, { platform });
-  const elevated = buildElevatedWorkspaceConfig(normalizedNormal, elevatedRoot, { platform });
+  if (typeof elevatedRoot !== 'string' || !path.isAbsolute(elevatedRoot) || elevatedRoot.includes('\0')) {
+    fail('Host Access lease root is invalid.', 'INVALID_ELEVATED_LEASE');
+  }
   if (typeof bootSessionId !== 'string' || !LEASE_ID_PATTERN.test(bootSessionId)) {
     fail('Boot-session identity is invalid.', 'INVALID_ELEVATED_LEASE');
   }
@@ -150,20 +137,18 @@ export function createElevatedLease({
   if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > MAX_ELEVATED_LEASE_MS) {
     fail('Elevated lease lifetime must be greater than zero and no longer than 1 hour.', 'INVALID_ELEVATED_DURATION');
   }
-  if (!['docker-full', FULL_HOST_ACCESS_LEVEL].includes(accessLevel)) {
-    fail('Elevated lease access level is invalid.', 'INVALID_ELEVATED_LEASE');
-  }
-  if (accessLevel === FULL_HOST_ACCESS_LEVEL && !INSTANCE_ID_PATTERN.test(instanceId)) {
+  if (!INSTANCE_ID_PATTERN.test(instanceId)) {
     fail('Full Host lease instance identity is invalid.', 'INVALID_ELEVATED_LEASE');
   }
   return Object.freeze({
-    version: accessLevel === FULL_HOST_ACCESS_LEVEL ? HOST_ACCESS_LEASE_VERSION : ELEVATED_LEASE_VERSION,
-    ...(accessLevel === FULL_HOST_ACCESS_LEVEL ? { accessLevel, instanceId } : {}),
+    version: HOST_ACCESS_LEASE_VERSION,
+    accessLevel: FULL_HOST_ACCESS_LEVEL,
+    instanceId,
     id: leaseId,
     bootSessionId,
     loginSessionId,
     normalRoot: normalizedNormal.hostRoot,
-    elevatedRoot: elevated.hostRoot,
+    elevatedRoot: path.resolve(elevatedRoot),
     issuedAt: now,
     expiresAt: now + durationMs,
   });
@@ -179,11 +164,10 @@ export function parseElevatedLease(text) {
   if (!isPlainObject(value)) {
     fail('Elevated lease must be an object.', 'INVALID_ELEVATED_LEASE');
   }
-  const hostAccess = value.version === HOST_ACCESS_LEASE_VERSION;
   assertExactKeys(value, new Set([
     'version',
-    ...(hostAccess ? ['accessLevel'] : []),
-    ...(hostAccess ? ['instanceId'] : []),
+    'accessLevel',
+    'instanceId',
     'id',
     'bootSessionId',
     'loginSessionId',
@@ -193,9 +177,9 @@ export function parseElevatedLease(text) {
     'expiresAt',
   ]));
   if (
-    ![ELEVATED_LEASE_VERSION, HOST_ACCESS_LEASE_VERSION].includes(value.version)
-    || (hostAccess && value.accessLevel !== FULL_HOST_ACCESS_LEVEL)
-    || (hostAccess && (typeof value.instanceId !== 'string' || !INSTANCE_ID_PATTERN.test(value.instanceId)))
+    value.version !== HOST_ACCESS_LEASE_VERSION
+    || value.accessLevel !== FULL_HOST_ACCESS_LEVEL
+    || typeof value.instanceId !== 'string' || !INSTANCE_ID_PATTERN.test(value.instanceId)
     || !LEASE_ID_PATTERN.test(value.id ?? '')
     || !LEASE_ID_PATTERN.test(value.bootSessionId ?? '')
     || !LEASE_ID_PATTERN.test(value.loginSessionId ?? '')
@@ -232,7 +216,6 @@ export function evaluateElevatedLease(lease, {
   let normalizedNormal;
   try {
     normalizedNormal = normalizeWorkspaceConfig(normalConfig, { platform });
-    buildElevatedWorkspaceConfig(normalizedNormal, lease.elevatedRoot, { platform });
   } catch (error) {
     return Object.freeze({ state: 'invalid', reason: error.message });
   }
@@ -245,7 +228,7 @@ export function evaluateElevatedLease(lease, {
   if (lease.normalRoot !== normalizedNormal.hostRoot) {
     return Object.freeze({ state: 'config_changed', reason: 'Normal workspace root changed after lease creation.' });
   }
-  if (lease.version === HOST_ACCESS_LEASE_VERSION && lease.instanceId !== instanceId) {
+  if (lease.instanceId !== instanceId) {
     return Object.freeze({ state: 'instance_changed', reason: 'Full Host lease belongs to another WebMCP instance.' });
   }
   if (!Number.isSafeInteger(now) || now < lease.issuedAt) {
@@ -310,7 +293,7 @@ export function elevatedLeasePublicStatus(state, { now = Date.now() } = {}) {
   }
   return Object.freeze({
     mode: 'elevated',
-    accessLevel: state.lease.accessLevel ?? 'docker-full',
+    accessLevel: state.lease.accessLevel,
     selectedRoot: state.lease.elevatedRoot,
     expiresAt: new Date(state.lease.expiresAt).toISOString(),
     remainingMs: Math.max(0, state.lease.expiresAt - now),

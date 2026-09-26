@@ -57,15 +57,10 @@ export function createHostRelay({
   spawnImpl = spawn,
   command = nativeDockerExecCommand(),
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
-  deadlineAt = null,
-  onDeadline = null,
   hostCommandHandler = null,
 } = {}) {
   if (!Array.isArray(command) || command.length < 2 || command.some((part) => typeof part !== 'string' || part.length === 0)) {
     throw new Error('Host relay command must be a non-empty argv array.');
-  }
-  if (deadlineAt !== null && (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0 || typeof onDeadline !== 'function')) {
-    throw new Error('Host relay deadline requires a positive timestamp and revocation callback.');
   }
 
   let child = null;
@@ -80,7 +75,6 @@ export function createHostRelay({
   let closed = false;
   let failed = false;
   let stdinEnded = false;
-  let deadlineTriggered = false;
   let inputBuffer = Buffer.alloc(0);
   const pendingToolLists = new Set();
   const activeHostRequests = new Set();
@@ -268,16 +262,7 @@ export function createHostRelay({
   }
 
   function onStdinData(chunk) {
-    if (closed || failed || deadlineTriggered) {
-      return;
-    }
-    if (deadlineAt !== null && Date.now() >= deadlineAt) {
-      deadlineTriggered = true;
-      stdin.pause();
-      // The chunk is never forwarded, so its requests can only be answered here.
-      ledger.observe(chunk);
-      refuseOutstanding('temporary elevated access expired');
-      onDeadline();
+    if (closed || failed) {
       return;
     }
     if (!hostCommandHandler) {
@@ -377,9 +362,8 @@ export function createHostRelay({
         }
       });
 
-      // Request bytes remain opaque to the host boundary. Elevated mode adds
-      // only an absolute pre-forward deadline gate; request parsing and tool
-      // semantics remain inside the verified Native container.
+      // Request bytes remain opaque to the host boundary: request parsing and
+      // tool semantics remain inside the verified Native container.
       stdin.on('data', onStdinData);
       stdin.on('end', onStdinEnd);
       stdin.resume?.();

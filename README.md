@@ -9,8 +9,7 @@ This repository owns the common local execution boundary:
 - read-only and multi-mount workspace policy;
 - immutable host-runtime releases;
 - per-instance state and lifecycle locks;
-- bounded temporary elevated leases;
-- high-trust host command execution with local approval and revocation.
+- two access levels: mounted folders with per-folder Write, and time-bounded Host Access (high-trust host command execution with local approval and revocation; the container never changes).
 
 Provider-specific browser/UI/tunnel integration does not belong here.
 

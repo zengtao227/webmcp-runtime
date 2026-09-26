@@ -18,8 +18,6 @@ import {
 export const NATIVE_CONTAINER_NAME = 'webmcp-native';
 export const NATIVE_GIT_KEY_PATH = '/run/secrets/webmcp-git-key';
 export const NATIVE_GIT_KNOWN_HOSTS_PATH = '/run/secrets/webmcp-git-known-hosts';
-export const NATIVE_ELEVATED_LEASE_LABEL = 'com.webmcp.native.elevated-lease';
-const ELEVATED_LEASE_ID_PATTERN = /^[0-9a-f]{64}$/;
 
 function sha256Text(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -71,7 +69,6 @@ export async function buildNativeContainerRun({
   protectedPaths = [],
   gitCredentialPath = null,
   gitKnownHostsPath = null,
-  elevationLeaseId = null,
   platform = process.platform,
   hostUid = typeof process.getuid === 'function' ? process.getuid() : null,
   hostGid = typeof process.getgid === 'function' ? process.getgid() : null,
@@ -79,9 +76,6 @@ export async function buildNativeContainerRun({
   assertImage(image);
   if (typeof containerName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(containerName)) {
     throw new ContainerPolicyError('Native container name is invalid.', 'INVALID_CONTAINER_NAME');
-  }
-  if (elevationLeaseId !== null && !ELEVATED_LEASE_ID_PATTERN.test(elevationLeaseId)) {
-    throw new ContainerPolicyError('Temporary elevated container requires a valid lease identity.', 'INVALID_ELEVATION_LEASE_ID');
   }
   if (!Number.isInteger(hostUid) || hostUid <= 0 || !Number.isInteger(hostGid) || hostGid < 0) {
     throw new ContainerPolicyError(
@@ -98,12 +92,6 @@ export async function buildNativeContainerRun({
   const canonicalRoot = canonicalMountConfig === null
     ? await canonicalizeHostRoot(normalized.hostRoot, { platform })
     : path.resolve(normalized.hostRoot);
-  if (canonicalMountConfig !== null && elevationLeaseId !== null) {
-    throw new ContainerPolicyError(
-      'Temporary elevation for multi-mount workspaces is not defined yet.',
-      'MULTI_MOUNT_ELEVATION_UNSUPPORTED',
-    );
-  }
 
   let canonicalGitCredential = null;
   let canonicalGitKnownHosts = null;
@@ -159,7 +147,6 @@ export async function buildNativeContainerRun({
       gitKnownHostsSource: canonicalGitKnownHosts,
       hostUid,
       hostGid,
-      ...(elevationLeaseId === null ? {} : { elevationLeaseId }),
       masks: maskPlan.map(({ type, destination }) => ({ type, destination })),
     }
     : {
@@ -192,7 +179,6 @@ export async function buildNativeContainerRun({
     '--name', containerName,
     '--label', `com.webmcp.native.policy-sha256=${policyDigest}`,
     '--label', `com.webmcp.native.image=${image}`,
-    ...(elevationLeaseId === null ? [] : ['--label', `${NATIVE_ELEVATED_LEASE_LABEL}=${elevationLeaseId}`]),
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--user', `${hostUid}:${hostGid}`,
@@ -245,7 +231,6 @@ export async function buildNativeContainerRun({
     policyDigest,
     gitCredentialSource: canonicalGitCredential,
     gitKnownHostsSource: canonicalGitKnownHosts,
-    elevationLeaseId,
     containerName,
   });
 }

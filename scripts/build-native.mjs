@@ -27,7 +27,6 @@ const DEPLOY_PAYLOAD = Object.freeze([
   'native/deploy/local-approval.js',
   'native/deploy/instance-transition.js',
   'native/deploy/local-instance-controller.js',
-  'native/deploy/local-instance-expiry.js',
   'native/deploy/runtime-payload.js',
   'native/deploy/workspace-config.js',
   'native/deploy/workspace-mount-config.js',
